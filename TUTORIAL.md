@@ -205,7 +205,7 @@ cargo add reqwest --features json,stream
 
 改動三處：
 
-**(1) SSE parser** — SSE 是純文字協定，每個事件長這樣：`data: {...json...}\n\n`。因為網路 chunk 可能把事件切在任意位置，要自己緩衝：
+**(1) SSE parser** — SSE 是純文字協定，每個事件長這樣：`data: {...json...}\n\n`。因為網路 chunk 可能把事件切在任意位置，要自己緩衝。注意第一行的 `.replace("\r\n", "\n")`：Gemini 這個端點實際回傳的事件是用 `\r\n\r\n` 結尾（CRLF），不先正規化的話 `find("\n\n")` 永遠找不到事件邊界，程式會安靜地什麼都不輸出——這是實測踩到的坑，不是理論：
 
 ```rust
 struct SseParser {
@@ -219,7 +219,8 @@ impl SseParser {
 
     /// 餵進一個 chunk，吐出所有「已完整」的 data payload
     fn push(&mut self, chunk: &[u8]) -> Vec<String> {
-        self.buf.push_str(&String::from_utf8_lossy(chunk));
+        self.buf
+            .push_str(&String::from_utf8_lossy(chunk).replace("\r\n", "\n"));
         let mut out = Vec::new();
         while let Some(pos) = self.buf.find("\n\n") {
             let event: String = self.buf.drain(..pos + 2).collect();
@@ -324,7 +325,8 @@ impl SseParser {
     }
 
     fn push(&mut self, chunk: &[u8]) -> Vec<String> {
-        self.buf.push_str(&String::from_utf8_lossy(chunk));
+        self.buf
+            .push_str(&String::from_utf8_lossy(chunk).replace("\r\n", "\n"));
         let mut out = Vec::new();
         while let Some(pos) = self.buf.find("\n\n") {
             let event: String = self.buf.drain(..pos + 2).collect();
@@ -540,25 +542,306 @@ async fn main() -> Result<()> {
 
 ---
 
-## Step 5 — 延伸：從 rs-agent 到 rs-cli
+## Step 5 — 接上 MCP：工具改由外部提供（~250 行）
 
-到這裡你已經有一個 200 行的完整 agent。rs-cli 做的事就是在這個骨架上疊加工程化的東西，對照著讀：
+**學什麼**：MCP（Model Context Protocol）是工具的「USB 標準」——工具由外部 server 提供，任何支援 MCP 的 agent 都能接上就用。這一步用 `rmcp` crate 當 MCP client：spawn 一個 server 子行程（stdio transport）、跟它要工具清單、把工具呼叫轉發給它。做完之後，Step 4 寫死的 `read_file`/`run_command` 就從你的程式碼裡消失了——agent 本體只剩「宣告轉換＋轉呼叫」，工具要幾個有幾個。
+
+前置需求：需要 Node.js（`npx`）。這是純 Rust 教學的唯一例外——現成穩定的 MCP server 生態以 npm 為主，我們用官方參考實作 `@modelcontextprotocol/server-filesystem` 來當對接目標（它剛好提供 `read_text_file`/`list_directory` 等工具，跟 Step 4 手寫的那兩個呼應：你自己寫的工具，換成標準化外部提供的）。
+
+加依賴：
+
+```bash
+cargo add rmcp --no-default-features --features client,transport-child-process
+```
+
+改動五處：
+
+**(1) imports** — 檔案開頭加：
+
+```rust
+use rmcp::model::CallToolRequestParams;
+use rmcp::service::RunningService;
+use rmcp::transport::TokioChildProcess;
+use rmcp::{RoleClient, ServiceExt};
+use tokio::process::Command;
+```
+
+**(2) 連線 MCP server**（新函式）——spawn 子行程、完成 MCP 的 initialize 握手，回傳一個能跟 server 對話的 client：
+
+```rust
+async fn connect_mcp(cmd: &str, args: &[&str]) -> Result<RunningService<RoleClient, ()>> {
+    let mut c = Command::new(cmd);
+    c.args(args);
+    let transport = TokioChildProcess::new(c)?;
+    Ok(().serve(transport).await?)
+}
+```
+
+`()` 當 client handler 是 rmcp 的慣用寫法：我們只當「發請求的一方」，不需要處理 server 主動發來的請求，所以 handler 是空的。
+
+**(3) `tool_declarations` 改成從 MCP 動態組**——刪掉整段寫死的 JSON，改成跟 server 要清單再轉成 Gemini 格式：
+
+```rust
+async fn tool_declarations(mcp: &RunningService<RoleClient, ()>) -> Result<Value> {
+    let tools = mcp.list_all_tools().await?;
+    let decls: Vec<Value> = tools
+        .iter()
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description.as_deref().unwrap_or(""),
+                "parameters": sanitize_schema(&Value::Object((*t.input_schema).clone())),
+            })
+        })
+        .collect();
+    Ok(json!([{"functionDeclarations": decls}]))
+}
+```
+
+這裡一定會踩到常見坑速查表裡那條 `400 Unknown name "$defs"`：真實的 MCP server（尤其 TypeScript/zod 產生的）吐出來的 JSON Schema 常帶 `$defs`/`$ref`/`additionalProperties`/`oneOf`，但 Gemini 的 tool schema 只收受限的 OpenAPI 子集。所以要多一個 `sanitize_schema`，遞迴走訪整個 schema、把不支援的 key 刪掉：
+
+```rust
+const UNSUPPORTED_KEYS: &[&str] = &[
+    "$schema", "$id", "$comment", "$defs", "definitions", "$ref",
+    "additionalProperties", "unevaluatedProperties", "patternProperties",
+    "oneOf", "allOf", "not", "if", "then", "else", "const", "prefixItems",
+];
+
+fn sanitize_schema(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(k, _)| !UNSUPPORTED_KEYS.contains(&k.as_str()))
+                .map(|(k, val)| (k.clone(), sanitize_schema(val)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(sanitize_schema).collect()),
+        _ => v.clone(),
+    }
+}
+```
+
+（簡化版：直接把 `$ref` 刪掉，欄位會變成「無約束」。rs-cli 的完整版會先把 `$defs` 裡的定義 inline 回 `$ref` 的位置再刪，教學版先不做。）
+
+**(4) `run_tool` 改成 async、轉發給 MCP**——不再自己讀檔跑指令，而是把呼叫包成 MCP 請求送給 server，收回文字結果：
+
+```rust
+async fn run_tool(mcp: &RunningService<RoleClient, ()>, name: &str, args: &Value) -> String {
+    let mut params = CallToolRequestParams::new(name.to_string());
+    params.arguments = args.as_object().cloned();
+    match mcp.call_tool(params).await {
+        Ok(r) => r
+            .content
+            .iter()
+            .filter_map(|b| b.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(e) => format!("error: {e}"),
+    }
+}
+```
+
+`confirm()` 保留不動——工具的**來源**變了，但「執行前要人確認」的原則不變。呼叫處改成 `run_tool(&mcp, name, &c["args"]).await`。
+
+**(5) `main`**——進 REPL 前先連 server、拿工具清單；`stream_once` 的簽名多帶一個 `tools: &Value`（body 裡的 `"tools"` 用它，不再呼叫舊的 `tool_declarations()`）；結束前關掉連線：
+
+```rust
+    // 啟動並連上 MCP server（filesystem server，範圍限定在目前目錄）
+    let mcp = connect_mcp("npx", &["-y", "@modelcontextprotocol/server-filesystem", "."]).await?;
+    let tools = tool_declarations(&mcp).await?;
+    let n = tools[0]["functionDeclarations"].as_array().map_or(0, |a| a.len());
+
+    println!("rs-agent  model={MODEL}  tools={n}(MCP)  (/quit 離開)");
+    // ... REPL 迴圈同 Step 4，stream_once 多傳 &tools，run_tool 多傳 &mcp ...
+    mcp.cancel().await?;
+    Ok(())
+```
+
+**驗證**：
+
+```
+❯ 列出目前目錄的檔案，然後讀 Cargo.toml 告訴我有哪些依賴
+⏺ list_directory {"path":"."}
+  執行嗎？ [y/N] y
+⏺ read_text_file {"path":"Cargo.toml"}
+  執行嗎？ [y/N] y
+（模型用檔案內容回答——但這次 read 的實作不在你的程式裡）
+```
+
+啟動時 banner 的 `tools={n}` 應該顯示十個左右——filesystem server 提供的工具比你 Step 4 手寫的兩個多得多，而你一行工具實作都沒寫。
+
+**這一步的核心觀念**：
+
+1. agent 程式碼從此**不含任何工具實作**——只做兩件事：把 server 的工具清單轉成 provider 的宣告格式、把模型的呼叫轉發回 server
+2. MCP 的生命週期就三步：initialize（`connect_mcp` 裡的握手）→ `tools/list`（拿清單）→ `tools/call`（執行），你在 Step 4 學的 agent loop 完全不用改
+3. **schema 相容性是接真實 server 時最大的坑**——provider 各自支援的 schema 子集不同，中間永遠需要一層 `sanitize_schema` 這樣的轉換
+
+---
+
+## Step 6 — Skills：漸進式揭露（~300 行）
+
+**學什麼**：Skills 是給 agent 的「使用手冊」——把領域知識寫成 Markdown 檔，agent 需要時自己翻。重點是**漸進式揭露（progressive disclosure）**：system prompt 只放目錄（每個技能一行 name + description），全文等模型自己判斷需要時才用 `read_skill` 工具讀進 context。技能再多，平時只占目錄那幾行的 token；而且加技能＝加一個檔案，不用改程式、不用重編譯。
+
+不加新依賴。frontmatter（SKILL.md 開頭 `---` 夾住的 metadata）用手刻解析——只需要 `name`/`description` 兩個欄位，為此引入 `serde_yaml` 不值得（rs-cli 用了 serde_yaml，因為它本來就有這個依賴；我們字串處理 20 行搞定）。
+
+技能檔的格式長這樣——在專案裡建 `skills/commit-style/SKILL.md`：
+
+```markdown
+---
+name: commit-style
+description: 本專案 git commit 訊息的撰寫規範，寫 commit 訊息前必讀
+---
+
+# Commit 訊息規範
+
+- 標題格式：`step-N: 一句話描述`（沿用本 repo 的分支慣例）
+- 正文用繁體中文，解釋「為什麼改」而不是「改了什麼」
+- 如果這次修改是 debug 的結果，把 debug 過程的關鍵發現寫進正文
+```
+
+改動四處：
+
+**(1) `Skill` 結構 + `load_skills`**（新）——掃 `skills/<name>/SKILL.md`，只解析 frontmatter，不讀內文：
+
+```rust
+struct Skill {
+    name: String,
+    description: String,
+    path: std::path::PathBuf,
+}
+
+fn load_skills(dir: &str) -> Vec<Skill> {
+    let mut skills = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return skills; // 沒有 skills 目錄就是零技能，不是錯誤
+    };
+    for entry in entries.flatten() {
+        let path = entry.path().join("SKILL.md");
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // frontmatter = 開頭兩個 --- 之間的區塊
+        let Some(rest) = raw.strip_prefix("---") else { continue };
+        let Some((fm, _body)) = rest.split_once("---") else { continue };
+        let field = |key: &str| {
+            fm.lines()
+                .find_map(|l| l.strip_prefix(&format!("{key}:")))
+                .map(|v| v.trim().to_string())
+        };
+        let (Some(name), Some(description)) = (field("name"), field("description")) else {
+            continue;
+        };
+        skills.push(Skill { name, description, path });
+    }
+    skills
+}
+```
+
+**(2) system prompt**（新函式）——目錄只放一行一個技能，並告訴模型「先讀再做」：
+
+```rust
+fn system_prompt(skills: &[Skill]) -> String {
+    let mut s = String::from("你是 rs-agent，一個在終端機執行的助理。");
+    if !skills.is_empty() {
+        s.push_str(
+            "\n\n# Skills\n\
+             以下是可用的技能。當任務符合某個技能的描述時，\
+             先用 read_skill 工具讀取全文，再照指示執行：\n",
+        );
+        for sk in skills {
+            s.push_str(&format!("- {}: {}\n", sk.name, sk.description));
+        }
+    }
+    s
+}
+```
+
+送出的方式是 Gemini 的 `systemInstruction` 欄位——`stream_once` 的 body 改成：
+
+```rust
+    let body = json!({
+        "systemInstruction": {"parts": [{"text": system}]},
+        "contents": history,
+        "tools": tools,
+    });
+```
+
+（`stream_once` 簽名多帶一個 `system: &str`。順便你就學會了 system prompt 怎麼加——想給 agent 個性也是改這裡。）
+
+**(3) `read_skill` 工具**——手動附加到 MCP 來的宣告清單後面（在 `tool_declarations` 裡 `decls.push(...)`）：
+
+```rust
+    decls.push(json!({
+        "name": "read_skill",
+        "description": "讀取一個技能的完整說明。執行技能相關任務前先呼叫這個。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "技能名稱"}
+            },
+            "required": ["name"]
+        }
+    }));
+```
+
+然後在 main 的工具分派處攔截：名字是 `read_skill` 就本地讀檔，其他照舊走 MCP。`read_skill` 不需要 `confirm()`——它唯讀、路徑受控（只能讀 `load_skills` 掃到的那幾個檔案），跟「跑任意 shell 指令」的風險等級完全不同：
+
+```rust
+    let output = if name == "read_skill" {
+        let skill_name = c["args"]["name"].as_str().unwrap_or_default();
+        skills.iter().find(|s| s.name == skill_name).map_or_else(
+            || format!("unknown skill: {skill_name}"),
+            |s| std::fs::read_to_string(&s.path).unwrap_or_else(|e| format!("error: {e}")),
+        )
+    } else if confirm()? {
+        run_tool(&mcp, name, &c["args"]).await
+    } else {
+        "使用者拒絕了這次工具呼叫".to_string()
+    };
+```
+
+**(4) `main`**——啟動時 `let skills = load_skills("skills");`、`let system = system_prompt(&skills);`，banner 加上 `skills={}`（用 `skills.len()`）。
+
+**驗證**（重點是驗「漸進式揭露」兩面都成立）：
+
+```
+❯ 1+1 等於多少
+2
+（模型不會呼叫 read_skill——目錄裡的 description 判斷跟這個問題無關，
+ 技能全文一個 token 都沒花）
+
+❯ 幫我為這次修改寫一個 commit 訊息
+⏺ read_skill {"name":"commit-style"}
+  ✓ 214 bytes
+（模型讀完規範，照著「step-N: 開頭、繁體中文、寫為什麼」的格式產出）
+```
+
+**這一步的核心觀念**：
+
+1. system prompt 只放**索引**，內容**按需載入**——這就是 context 工程最基本的一招：不是塞更多，而是讓模型自己決定何時拉取
+2. 技能就是檔案——加技能不用改程式碼、不用重編譯，丟一個 `SKILL.md` 進去就生效
+3. `description` 的品質直接決定模型會不會在對的時機想起這個技能——寫「本專案 git commit 訊息的撰寫規範，寫 commit 訊息前必讀」而不是「commit 相關」
+
+---
+
+## 結語 — 從 rs-agent 到 rs-cli
+
+到這裡你已經有一個約 300 行、接得上 MCP 生態、帶 Skills 的完整 agent。rs-cli 做的事就是在這個骨架上繼續疊工程化的東西，對照著讀：
 
 | rs-agent 的做法 | rs-cli 的做法 | 檔案 |
 |---|---|---|
 | 寫死 Gemini | `Provider` trait + 三個實作，config 切換 | `src/provider/mod.rs` |
 | 訊息用 `serde_json::Value` 硬組 | 內部統一 `Message`/`ContentBlock` 型別，各 provider 自己轉換 | `src/provider/types.rs` |
-| 工具寫死在程式裡 | MCP：工具由外部 server 提供，動態聚合 | `src/mcp/manager.rs` |
+| 只接一個 MCP server | 多 server 聚合，工具名加 `server__` 前綴避免衝突，單一 server 掛掉不影響其他 | `src/mcp/manager.rs` |
 | main 裡一坨 loop | agent loop 抽成 `Agent::run_turn`，UI 用 callback 解耦 | `src/agent.rs` |
 | history 無限長 | 超過字元預算時裁掉舊 turn（注意不能拆散 tool call/result 配對） | `agent.rs` 的 `trim_history` |
-| — | Skills 漸進式揭露（system prompt 只放目錄，內容按需讀取） | `src/skills.rs` |
+| `sanitize_schema` 直接刪 `$ref` | 先把 `$defs` 定義 inline 回去再清理（深度限制防循環） | `src/provider/gemini.rs` |
 
 建議練習（依難度排序）：
 
-1. **加第三個工具** `write_file`（含確認），感受加工具有多便宜
-2. **加 system prompt**：body 加 `"systemInstruction": {"parts": [{"text": "..."}]}`，給 agent 個性
+1. **多接一個 MCP server**：工具名怎麼避免衝突？（提示：rs-cli 用 `server__tool` 前綴）
+2. **加第二個技能**，感受「加技能不用改程式碼」
 3. **抽 Provider trait**：定義 `trait Provider { async fn chat(...) }`，先做 Gemini 實作，再加一個 Ollama（OpenAI-compat）實作——做完你就懂為什麼 rs-cli 要有 `types.rs`
-4. **接一個 MCP server**：用 `rmcp` crate，把寫死的工具換成外部來的
 
 ---
 
@@ -566,7 +849,8 @@ async fn main() -> Result<()> {
 
 | 症狀 | 原因 |
 |---|---|
-| `400 Unknown name "$defs" ... parameters` | Gemini 的 tool schema 是受限的 OpenAPI 子集，不接受 `$ref`/`$defs`/`additionalProperties`/`oneOf`（rs-cli 的 `sanitize_schema` 就是在處理這個） |
+| `400 Unknown name "$defs" ... parameters` | Gemini 的 tool schema 是受限的 OpenAPI 子集，不接受 `$ref`/`$defs`/`additionalProperties`/`oneOf`（Step 5 的 `sanitize_schema` 就是在處理這個） |
+| 串流完全沒輸出、也不報錯 | SSE 事件邊界沒抓到——Gemini 用 `\r\n\r\n` 結尾，`find("\n\n")` 前要先 `.replace("\r\n", "\n")`（Step 3 的 SseParser 第一行） |
 | 串流看不到逐字效果 | `print!` 之後忘了 `io::stdout().flush()` |
 | 模型「失憶」 | 忘了把 model 回覆 push 回 history |
 | tool loop 跑不停 | 工具回傳錯誤訊息但格式讓模型誤解，或沒把 `functionResponse` 塞回 history |
