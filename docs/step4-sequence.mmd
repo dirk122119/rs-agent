@@ -1,0 +1,52 @@
+sequenceDiagram
+    actor User
+    participant Main as main (REPL)
+    participant SO as stream_once
+    participant API as Gemini API
+    participant Confirm as confirm()
+    participant Tool as run_tool()
+
+    User->>Main: 輸入一行 (line)
+    Main->>Main: history.push({role: user, parts: [{text: line}]})
+
+    rect rgb(240, 240, 255)
+    note over Main: 內層 agent loop 開始
+    loop 只要模型還要求呼叫工具
+        Main->>SO: stream_once(client, api_key, history)
+        SO->>API: POST streamGenerateContent?alt=sse<br/>{contents: history, tools: [...]}
+        activate API
+        API-->>SO: SSE chunk (text part)
+        SO-->>User: print!(text) 即時輸出
+        API-->>SO: SSE chunk (functionCall part)
+        SO->>SO: calls.push(functionCall)
+        API-->>SO: 串流結束 (連線關閉)
+        deactivate API
+        SO-->>Main: 回傳 (text, calls)
+
+        Main->>Main: history.push({role: model, parts: [text?, functionCall...]})
+
+        alt calls 為空
+            Main->>Main: break，這輪結束
+        else calls 不為空
+            loop 每一個 functionCall
+                Main-->>User: 印出 "⏺ {name} {args}"
+                Main->>Confirm: confirm()
+                Confirm->>User: "執行嗎？[y/N]"
+                User-->>Confirm: y / n
+                Confirm-->>Main: true / false
+                alt 使用者同意 (y)
+                    Main->>Tool: run_tool(name, args)
+                    Tool-->>Main: 執行結果 (stdout/檔案內容/錯誤)
+                else 使用者拒絕
+                    Main->>Main: output = "使用者拒絕了這次工具呼叫"
+                end
+                Main-->>User: 印出 "✓ {N} bytes"
+                Main->>Main: responses.push(functionResponse)
+            end
+            Main->>Main: history.push({role: user, parts: responses})
+            note over Main: 回到 loop 開頭，帶著工具結果再呼叫模型一次
+        end
+    end
+    end
+    note over Main: 內層 loop 結束
+    Main-->>User: println!() 空行，回到外層 prompt "❯"
