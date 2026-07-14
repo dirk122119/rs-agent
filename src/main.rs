@@ -5,6 +5,8 @@ use std::io::{self, Write};
 
 const MODEL: &str = "gemini-2.5-flash";
 
+// ---------- SSE parser（同 Step 3） ----------
+
 struct SseParser {
     buf: String,
 }
@@ -31,8 +33,78 @@ impl SseParser {
     }
 }
 
-async fn call_gemini(client: &reqwest::Client, api_key: &str, history: &[Value]) -> Result<String> {
-    let body = json!({"contents": history});
+// ---------- 工具定義與執行 ----------
+
+/// 告訴模型有哪些工具可用（JSON Schema 描述參數）
+fn tool_declarations() -> Value {
+    json!([{
+        "functionDeclarations": [
+            {
+                "name": "read_file",
+                "description": "讀取一個文字檔並回傳內容",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "檔案路徑"}
+                    },
+                    "required": ["path"]
+                }
+            },
+            {
+                "name": "run_command",
+                "description": "執行 shell 指令並回傳 stdout+stderr",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "要執行的指令"}
+                    },
+                    "required": ["command"]
+                }
+            }
+        ]
+    }])
+}
+
+fn run_tool(name: &str, args: &Value) -> String {
+    match name {
+        "read_file" => {
+            let path = args["path"].as_str().unwrap_or_default();
+            std::fs::read_to_string(path).unwrap_or_else(|e| format!("error: {e}"))
+        }
+        "run_command" => {
+            let cmd = args["command"].as_str().unwrap_or_default();
+            match std::process::Command::new("sh").arg("-c").arg(cmd).output() {
+                Ok(o) => format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+                Err(e) => format!("error: {e}"),
+            }
+        }
+        _ => format!("unknown tool: {name}"),
+    }
+}
+
+fn confirm() -> Result<bool> {
+    print!("  執行嗎？ [y/N] ");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(matches!(line.trim(), "y" | "yes"))
+}
+
+// ---------- 呼叫模型一次（串流），回傳 (文字, 工具呼叫們) ----------
+
+async fn stream_once(
+    client: &reqwest::Client,
+    api_key: &str,
+    history: &[Value],
+) -> Result<(String, Vec<Value>)> {
+    let body = json!({
+        "contents": history,
+        "tools": tool_declarations(),
+    });
     let resp = client
         .post(format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:streamGenerateContent?alt=sse"
@@ -46,24 +118,34 @@ async fn call_gemini(client: &reqwest::Client, api_key: &str, history: &[Value])
     }
 
     let mut parser = SseParser::new();
-    let mut full_text = String::new();
+    let mut text = String::new();
+    let mut calls = Vec::new();
     let mut bytes = resp.bytes_stream();
     while let Some(chunk) = bytes.next().await {
-        let chunk = chunk?;
-        for data in parser.push(&chunk) {
+        for data in parser.push(&chunk?) {
             let Ok(v) = serde_json::from_str::<Value>(&data) else {
                 continue;
             };
-            if let Some(t) = v["candidates"][0]["content"]["parts"][0]["text"].as_str() {
-                print!("{t}");
-                io::stdout().flush()?;
-                full_text.push_str(t);
+            let Some(parts) = v["candidates"][0]["content"]["parts"].as_array() else {
+                continue;
+            };
+            for part in parts {
+                if let Some(t) = part["text"].as_str() {
+                    print!("{t}");
+                    io::stdout().flush()?;
+                    text.push_str(t);
+                }
+                if part["functionCall"].is_object() {
+                    calls.push(part["functionCall"].clone());
+                }
             }
         }
     }
-    println!("\n");
-    Ok(full_text)
+    println!();
+    Ok((text, calls))
 }
+
+// ---------- 主程式：REPL 外圈 + agent loop 內圈 ----------
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -71,13 +153,13 @@ async fn main() -> Result<()> {
     let client = reqwest::Client::new();
     let mut history: Vec<Value> = Vec::new();
 
-    println!("rs-agent  model={MODEL}  (/quit 離開)");
+    println!("rs-agent  model={MODEL}  tools=2  (/quit 離開)");
     loop {
         print!("❯ ");
         io::stdout().flush()?;
         let mut line = String::new();
         if io::stdin().read_line(&mut line)? == 0 {
-            break; // Ctrl-D
+            break;
         }
         let line = line.trim();
         if line.is_empty() {
@@ -88,8 +170,46 @@ async fn main() -> Result<()> {
         }
 
         history.push(json!({"role": "user", "parts": [{"text": line}]}));
-        let reply = call_gemini(&client, &api_key, &history).await?;
-        history.push(json!({"role": "model", "parts": [{"text": reply}]}));
+
+        // agent loop：模型可能連續呼叫工具，直到不再呼叫為止
+        loop {
+            let (text, calls) = stream_once(&client, &api_key, &history).await?;
+
+            // 把模型這輪的輸出（文字 + 工具呼叫）記回 history
+            let mut parts = Vec::new();
+            if !text.is_empty() {
+                parts.push(json!({"text": text}));
+            }
+            for c in &calls {
+                parts.push(json!({"functionCall": c}));
+            }
+            if !parts.is_empty() {
+                history.push(json!({"role": "model", "parts": parts}));
+            }
+
+            if calls.is_empty() {
+                break; // 模型不要工具了，這輪結束
+            }
+
+            // 執行每個工具呼叫，把結果組成 functionResponse
+            let mut responses = Vec::new();
+            for c in &calls {
+                let name = c["name"].as_str().unwrap_or_default();
+                println!("⏺ {name} {}", c["args"]);
+                let output = if confirm()? {
+                    run_tool(name, &c["args"])
+                } else {
+                    "使用者拒絕了這次工具呼叫".to_string()
+                };
+                println!("  ✓ {} bytes", output.len());
+                responses.push(json!({
+                    "functionResponse": {"name": name, "response": {"content": output}}
+                }));
+            }
+            history.push(json!({"role": "user", "parts": responses}));
+            // 繼續 loop：把工具結果送回去，讓模型接著做
+        }
+        println!();
     }
     Ok(())
 }
