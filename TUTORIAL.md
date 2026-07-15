@@ -542,9 +542,9 @@ async fn main() -> Result<()> {
 
 ---
 
-## Step 5 — 接上 MCP：工具改由外部提供（~250 行）
+## Step 5 — 接上 MCP：工具改由外部提供（~270 行）
 
-**學什麼**：MCP（Model Context Protocol）是工具的「USB 標準」——工具由外部 server 提供，任何支援 MCP 的 agent 都能接上就用。這一步用 `rmcp` crate 當 MCP client：spawn 一個 server 子行程（stdio transport）、跟它要工具清單、把工具呼叫轉發給它。做完之後，Step 4 寫死的 `read_file`/`run_command` 就從你的程式碼裡消失了——agent 本體只剩「宣告轉換＋轉呼叫」，工具要幾個有幾個。
+**學什麼**：MCP（Model Context Protocol）是工具的「USB 標準」——工具由外部 server 提供，任何支援 MCP 的 agent 都能接上就用。這一步用 `rmcp` crate 當 MCP client：spawn server 子行程（stdio transport）、跟它要工具清單、把工具呼叫轉發給它。要接哪些 server 寫在 `.mcp.json` 設定檔裡（跟 Claude Code 的專案設定同一種格式），可以接多個。做完之後，Step 4 寫死的 `read_file`/`run_command` 就從你的程式碼裡消失了——agent 本體只剩「宣告轉換＋轉呼叫」，工具要幾個有幾個，加 server 也只是改設定檔。
 
 前置需求：需要 Node.js（`npx`）。這是純 Rust 教學的唯一例外——現成穩定的 MCP server 生態以 npm 為主，我們用官方參考實作 `@modelcontextprotocol/server-filesystem` 來當對接目標（它剛好提供 `read_text_file`/`list_directory` 等工具，跟 Step 4 手寫的那兩個呼應：你自己寫的工具，換成標準化外部提供的）。
 
@@ -554,24 +554,48 @@ async fn main() -> Result<()> {
 cargo add rmcp --no-default-features --features client,transport-child-process
 ```
 
-改動五處：
+改動六處：
 
-**(1) imports** — 檔案開頭加：
+**(1) `.mcp.json` 設定檔**（新檔案，放專案根目錄）——這是 Claude Code、Cursor 等工具通用的格式，`mcpServers` 底下每個 key 是一個 server，`command`/`args`/`env` 描述怎麼把它 spawn 起來：
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    }
+  }
+}
+```
+
+**(2) imports** — 檔案開頭加：
 
 ```rust
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
 use rmcp::transport::TokioChildProcess;
 use rmcp::{RoleClient, ServiceExt};
+use std::collections::HashMap;
 use tokio::process::Command;
 ```
 
-**(2) 連線 MCP server**（新函式）——spawn 子行程、完成 MCP 的 initialize 握手，回傳一個能跟 server 對話的 client：
+**(3) 連線 MCP server**（新函式）——吃一個 server 的設定 JSON，spawn 子行程、完成 MCP 的 initialize 握手，回傳一個能跟 server 對話的 client：
 
 ```rust
-async fn connect_mcp(cmd: &str, args: &[&str]) -> Result<RunningService<RoleClient, ()>> {
+async fn connect_mcp(cfg: &Value) -> Result<RunningService<RoleClient, ()>> {
+    let Some(cmd) = cfg["command"].as_str() else {
+        bail!("server 設定缺少 command: {cfg}");
+    };
     let mut c = Command::new(cmd);
-    c.args(args);
+    if let Some(args) = cfg["args"].as_array() {
+        c.args(args.iter().filter_map(|a| a.as_str()));
+    }
+    if let Some(env) = cfg["env"].as_object() {
+        for (k, v) in env {
+            c.env(k, v.as_str().unwrap_or_default());
+        }
+    }
     let transport = TokioChildProcess::new(c)?;
     Ok(().serve(transport).await?)
 }
@@ -579,22 +603,28 @@ async fn connect_mcp(cmd: &str, args: &[&str]) -> Result<RunningService<RoleClie
 
 `()` 當 client handler 是 rmcp 的慣用寫法：我們只當「發請求的一方」，不需要處理 server 主動發來的請求，所以 handler 是空的。
 
-**(3) `tool_declarations` 改成從 MCP 動態組**——刪掉整段寫死的 JSON，改成跟 server 要清單再轉成 Gemini 格式：
+**(4) `tool_declarations` 改成從 MCP 動態組**——刪掉整段寫死的 JSON，改成跟**每個** server 要清單、合併轉成 Gemini 格式。多了一個回傳值 `routes`（工具名 → server 索引）：工具清單合併之後，模型只會給你工具名，你得記得每個名字是哪個 server 的，呼叫時才知道轉發給誰：
 
 ```rust
-async fn tool_declarations(mcp: &RunningService<RoleClient, ()>) -> Result<Value> {
-    let tools = mcp.list_all_tools().await?;
-    let decls: Vec<Value> = tools
-        .iter()
-        .map(|t| {
-            json!({
+async fn tool_declarations(
+    services: &[RunningService<RoleClient, ()>],
+) -> Result<(Value, HashMap<String, usize>)> {
+    let mut decls: Vec<Value> = Vec::new();
+    let mut routes = HashMap::new();
+    for (i, mcp) in services.iter().enumerate() {
+        for t in mcp.list_all_tools().await? {
+            if routes.contains_key(t.name.as_ref()) {
+                continue; // 同名工具以先連上的 server 為準
+            }
+            routes.insert(t.name.to_string(), i);
+            decls.push(json!({
                 "name": t.name,
                 "description": t.description.as_deref().unwrap_or(""),
                 "parameters": sanitize_schema(&Value::Object((*t.input_schema).clone())),
-            })
-        })
-        .collect();
-    Ok(json!([{"functionDeclarations": decls}]))
+            }));
+        }
+    }
+    Ok((json!([{"functionDeclarations": decls}]), routes))
 }
 ```
 
@@ -623,7 +653,7 @@ fn sanitize_schema(v: &Value) -> Value {
 
 （簡化版：直接把 `$ref` 刪掉，欄位會變成「無約束」。rs-cli 的完整版會先把 `$defs` 裡的定義 inline 回 `$ref` 的位置再刪，教學版先不做。）
 
-**(4) `run_tool` 改成 async、轉發給 MCP**——不再自己讀檔跑指令，而是把呼叫包成 MCP 請求送給 server，收回文字結果：
+**(5) `run_tool` 改成 async、轉發給 MCP**——不再自己讀檔跑指令，而是把呼叫包成 MCP 請求送給 server，收回文字結果：
 
 ```rust
 async fn run_tool(mcp: &RunningService<RoleClient, ()>, name: &str, args: &Value) -> String {
@@ -641,20 +671,48 @@ async fn run_tool(mcp: &RunningService<RoleClient, ()>, name: &str, args: &Value
 }
 ```
 
-`confirm()` 保留不動——工具的**來源**變了，但「執行前要人確認」的原則不變。呼叫處改成 `run_tool(&mcp, name, &c["args"]).await`。
+`confirm()` 保留不動——工具的**來源**變了，但「執行前要人確認」的原則不變。
 
-**(5) `main`**——進 REPL 前先連 server、拿工具清單；`stream_once` 的簽名多帶一個 `tools: &Value`（body 裡的 `"tools"` 用它，不再呼叫舊的 `tool_declarations()`）；結束前關掉連線：
+**(6) `main`**——進 REPL 前讀 `.mcp.json`、逐一連上每個 server、拿合併後的工具清單；`stream_once` 的簽名多帶一個 `tools: &Value`（body 裡的 `"tools"` 用它，不再呼叫舊的 `tool_declarations()`）；結束前逐一關掉連線：
 
 ```rust
-    // 啟動並連上 MCP server（filesystem server，範圍限定在目前目錄）
-    let mcp = connect_mcp("npx", &["-y", "@modelcontextprotocol/server-filesystem", "."]).await?;
-    let tools = tool_declarations(&mcp).await?;
-    let n = tools[0]["functionDeclarations"].as_array().map_or(0, |a| a.len());
+    // 讀 .mcp.json（與 Claude Code 等工具相同格式），逐一連上每個 MCP server
+    let config: Value = serde_json::from_str(&std::fs::read_to_string(".mcp.json")?)?;
+    let Some(server_cfgs) = config["mcpServers"].as_object() else {
+        bail!(".mcp.json 裡找不到 mcpServers");
+    };
+    let mut names = Vec::new();
+    let mut services = Vec::new();
+    for (name, cfg) in server_cfgs {
+        services.push(connect_mcp(cfg).await?);
+        names.push(name.as_str());
+    }
+    let (tools, routes) = tool_declarations(&services).await?;
 
-    println!("rs-agent  model={MODEL}  tools={n}(MCP)  (/quit 離開)");
-    // ... REPL 迴圈同 Step 4，stream_once 多傳 &tools，run_tool 多傳 &mcp ...
-    mcp.cancel().await?;
+    println!(
+        "rs-agent  model={MODEL}  tools={}(MCP: {})  (/quit 離開)",
+        routes.len(),
+        names.join(", ")
+    );
+    // ... REPL 迴圈同 Step 4，stream_once 多傳 &tools ...
+    for mcp in services {
+        mcp.cancel().await?;
+    }
     Ok(())
+```
+
+工具呼叫處改成先查 `routes` 找到該轉發的 server；模型偶爾會幻覺出不存在的工具名，查不到就回個 error 讓它自己修正，不要 panic：
+
+```rust
+    let output = if let Some(&i) = routes.get(name) {
+        if confirm()? {
+            run_tool(&services[i], name, &c["args"]).await
+        } else {
+            "使用者拒絕了這次工具呼叫".to_string()
+        }
+    } else {
+        format!("error: 未知的工具 {name}")
+    };
 ```
 
 **驗證**：
@@ -668,13 +726,14 @@ async fn run_tool(mcp: &RunningService<RoleClient, ()>, name: &str, args: &Value
 （模型用檔案內容回答——但這次 read 的實作不在你的程式裡）
 ```
 
-啟動時 banner 的 `tools={n}` 應該顯示十個左右——filesystem server 提供的工具比你 Step 4 手寫的兩個多得多，而你一行工具實作都沒寫。
+啟動時 banner 應該顯示 `tools=14(MCP: filesystem)` 左右——filesystem server 提供的工具比你 Step 4 手寫的兩個多得多，而你一行工具實作都沒寫。想多接一個 server，在 `.mcp.json` 加一段就好，程式碼一行都不用動。
 
 **這一步的核心觀念**：
 
 1. agent 程式碼從此**不含任何工具實作**——只做兩件事：把 server 的工具清單轉成 provider 的宣告格式、把模型的呼叫轉發回 server
 2. MCP 的生命週期就三步：initialize（`connect_mcp` 裡的握手）→ `tools/list`（拿清單）→ `tools/call`（執行），你在 Step 4 學的 agent loop 完全不用改
 3. **schema 相容性是接真實 server 時最大的坑**——provider 各自支援的 schema 子集不同，中間永遠需要一層 `sanitize_schema` 這樣的轉換
+4. 多 server 之後，「工具名 → server」的路由表（`routes`）是必要的簿記——工具清單在 API 請求裡是攤平的，模型呼叫時只報名字不報出處
 
 ---
 
@@ -793,10 +852,14 @@ fn system_prompt(skills: &[Skill]) -> String {
             || format!("unknown skill: {skill_name}"),
             |s| std::fs::read_to_string(&s.path).unwrap_or_else(|e| format!("error: {e}")),
         )
-    } else if confirm()? {
-        run_tool(&mcp, name, &c["args"]).await
+    } else if let Some(&i) = routes.get(name) {
+        if confirm()? {
+            run_tool(&services[i], name, &c["args"]).await
+        } else {
+            "使用者拒絕了這次工具呼叫".to_string()
+        }
     } else {
-        "使用者拒絕了這次工具呼叫".to_string()
+        format!("error: 未知的工具 {name}")
     };
 ```
 
@@ -832,14 +895,14 @@ fn system_prompt(skills: &[Skill]) -> String {
 |---|---|---|
 | 寫死 Gemini | `Provider` trait + 三個實作，config 切換 | `src/provider/mod.rs` |
 | 訊息用 `serde_json::Value` 硬組 | 內部統一 `Message`/`ContentBlock` 型別，各 provider 自己轉換 | `src/provider/types.rs` |
-| 只接一個 MCP server | 多 server 聚合，工具名加 `server__` 前綴避免衝突，單一 server 掛掉不影響其他 | `src/mcp/manager.rs` |
+| 多 server 但同名工具先到先贏 | 工具名加 `server__` 前綴避免衝突，單一 server 掛掉不影響其他 | `src/mcp/manager.rs` |
 | main 裡一坨 loop | agent loop 抽成 `Agent::run_turn`，UI 用 callback 解耦 | `src/agent.rs` |
 | history 無限長 | 超過字元預算時裁掉舊 turn（注意不能拆散 tool call/result 配對） | `agent.rs` 的 `trim_history` |
 | `sanitize_schema` 直接刪 `$ref` | 先把 `$defs` 定義 inline 回去再清理（深度限制防循環） | `src/provider/gemini.rs` |
 
 建議練習（依難度排序）：
 
-1. **多接一個 MCP server**：工具名怎麼避免衝突？（提示：rs-cli 用 `server__tool` 前綴）
+1. **在 `.mcp.json` 多接一個 server**（例如 `@modelcontextprotocol/server-memory`），然後把「同名工具先到先贏」改成不會衝突的做法（提示：rs-cli 用 `server__tool` 前綴——宣告時加上去、呼叫時拆回來）
 2. **加第二個技能**，感受「加技能不用改程式碼」
 3. **抽 Provider trait**：定義 `trait Provider { async fn chat(...) }`，先做 Gemini 實作，再加一個 Ollama（OpenAI-compat）實作——做完你就懂為什麼 rs-cli 要有 `types.rs`
 

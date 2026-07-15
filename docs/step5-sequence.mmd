@@ -5,6 +5,20 @@ sequenceDiagram
     participant API as Gemini API
     participant Confirm as confirm()
     participant Tool as run_tool()
+    participant MCP as MCP server<br/>(filesystem, 子行程)
+
+    rect rgb(240, 255, 240)
+    note over Main, MCP: 啟動：讀 .mcp.json、連上每個 MCP server、動態組工具宣告
+    Main->>Main: 讀 .mcp.json 的 mcpServers
+    loop 每一個 server 設定
+        Main->>MCP: connect_mcp(cfg)<br/>spawn 子行程 (stdio transport) + initialize 握手
+        MCP-->>Main: RunningService (MCP client)
+    end
+    Main->>MCP: tool_declarations() → 對每個 server list_all_tools()
+    MCP-->>Main: 工具清單 (name, description, inputSchema)
+    note over Main: sanitize_schema() 遞迴刪掉 Gemini 不支援的 key<br/>($ref/$defs/oneOf/additionalProperties...)<br/>合併成 functionDeclarations<br/>routes 記住每個工具名屬於哪個 server
+    Main-->>User: 印出 "rs-agent model=... tools=N(MCP: ...)"
+    end
 
     User->>Main: 輸入一行 (line)
     Main->>Main: history.push({role: user, parts: [{text: line}]})
@@ -12,8 +26,8 @@ sequenceDiagram
     rect rgb(240, 240, 255)
     note over Main: 內層 agent loop 開始
     loop 只要模型還要求呼叫工具
-        Main->>SO: stream_once(client, api_key, history)
-        SO->>API: POST streamGenerateContent?alt=sse<br/>{contents: history, tools: [...]}
+        Main->>SO: stream_once(client, api_key, history, tools)
+        SO->>API: POST streamGenerateContent?alt=sse<br/>{contents: history, tools: 來自 MCP 的宣告}
         activate API
         API-->>SO: SSE chunk (text part)
         SO-->>User: print!(text) 即時輸出
@@ -35,8 +49,10 @@ sequenceDiagram
                 User-->>Confirm: y / n
                 Confirm-->>Main: true / false
                 alt 使用者同意 (y)
-                    Main->>Tool: run_tool(name, args)
-                    Tool-->>Main: 執行結果 (stdout/檔案內容/錯誤)
+                    Main->>Tool: run_tool(services[routes[name]], name, args)
+                    Tool->>MCP: call_tool(params)<br/>(JSON-RPC over stdio)
+                    MCP-->>Tool: CallToolResult (content blocks)
+                    Tool-->>Main: text blocks join 成字串
                 else 使用者拒絕
                     Main->>Main: output = "使用者拒絕了這次工具呼叫"
                 end
@@ -50,3 +66,6 @@ sequenceDiagram
     end
     note over Main: 內層 loop 結束
     Main-->>User: println!() 空行，回到外層 prompt "❯"
+
+    User->>Main: /quit
+    Main->>MCP: 對每個 server mcp.cancel() 關閉子行程
