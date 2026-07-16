@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use futures::StreamExt;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
-use rmcp::transport::TokioChildProcess;
+use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -41,10 +41,15 @@ impl SseParser {
 
 // ---------- MCP：設定、連線、工具宣告、工具執行 ----------
 
-/// 依 .mcp.json 裡一個 server 的設定（command/args/env）spawn 子行程並完成握手
+/// 依 .mcp.json 裡一個 server 的設定連線並完成握手：
+/// 有 url 走 Streamable HTTP（遠端），有 command 則 spawn 子行程（本機 stdio）
 async fn connect_mcp(cfg: &Value) -> Result<RunningService<RoleClient, ()>> {
+    if let Some(url) = cfg["url"].as_str() {
+        let transport = StreamableHttpClientTransport::from_uri(url.to_string());
+        return Ok(().serve(transport).await?);
+    }
     let Some(cmd) = cfg["command"].as_str() else {
-        bail!("server 設定缺少 command: {cfg}");
+        bail!("server 設定缺少 url 或 command: {cfg}");
     };
     let mut c = Command::new(cmd);
     if let Some(args) = cfg["args"].as_array() {

@@ -728,6 +728,37 @@ async fn run_tool(mcp: &RunningService<RoleClient, ()>, name: &str, args: &Value
 
 啟動時 banner 應該顯示 `tools=14(MCP: filesystem)` 左右——filesystem server 提供的工具比你 Step 4 手寫的兩個多得多，而你一行工具實作都沒寫。想多接一個 server，在 `.mcp.json` 加一段就好，程式碼一行都不用動。
 
+**延伸：接線上的 server（Streamable HTTP）**
+
+MCP 的 transport 除了 stdio（spawn 本機子行程）還有 Streamable HTTP——直接連遠端 URL。加一個 feature：
+
+```bash
+cargo add rmcp --no-default-features \
+  --features client,transport-child-process,transport-streamable-http-client-reqwest
+```
+
+`connect_mcp` 開頭加一個分支，設定裡有 `url` 就走 HTTP（`.mcp.json` 的遠端寫法也跟 Claude Code 相同）：
+
+```rust
+use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
+
+async fn connect_mcp(cfg: &Value) -> Result<RunningService<RoleClient, ()>> {
+    if let Some(url) = cfg["url"].as_str() {
+        let transport = StreamableHttpClientTransport::from_uri(url.to_string());
+        return Ok(().serve(transport).await?);
+    }
+    // ...原本的 command/args/env 分支照舊...
+```
+
+```json
+    "deepwiki": {
+      "type": "http",
+      "url": "https://mcp.deepwiki.com/mcp"
+    }
+```
+
+重點在於：兩種 transport 的 `().serve(transport)` 回傳同一個 `RunningService` 型別，所以 `tool_declarations`、`routes`、`run_tool` **全都不用改**——transport 被抽象掉了，這正是 MCP「USB 標準」的意思。DeepWiki 是公開免認證的 server（提供讀 GitHub repo 文件的工具），拿來驗證剛好；接需要認證的 server 時，用帶 `Authorization` header 的 `reqwest::Client` 配 `StreamableHttpClientTransport::with_client(...)`。
+
 **這一步的核心觀念**：
 
 1. agent 程式碼從此**不含任何工具實作**——只做兩件事：把 server 的工具清單轉成 provider 的宣告格式、把模型的呼叫轉發回 server

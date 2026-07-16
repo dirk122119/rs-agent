@@ -11,7 +11,7 @@ sequenceDiagram
     note over Main, MCP: 啟動：讀 .mcp.json、連上每個 MCP server、動態組工具宣告
     Main->>Main: 讀 .mcp.json 的 mcpServers
     loop 每一個 server 設定
-        Main->>MCP: connect_mcp(cfg)<br/>spawn 子行程 (stdio transport) + initialize 握手
+        Main->>MCP: connect_mcp(cfg)<br/>spawn 子行程 (stdio) 或連遠端 URL (Streamable HTTP)<br/>+ initialize 握手
         MCP-->>Main: RunningService (MCP client)
     end
     Main->>MCP: tool_declarations() → 對每個 server list_all_tools()
