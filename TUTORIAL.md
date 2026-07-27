@@ -757,7 +757,50 @@ async fn connect_mcp(cfg: &Value) -> Result<RunningService<RoleClient, ()>> {
     }
 ```
 
-重點在於：兩種 transport 的 `().serve(transport)` 回傳同一個 `RunningService` 型別，所以 `tool_declarations`、`routes`、`run_tool` **全都不用改**——transport 被抽象掉了，這正是 MCP「USB 標準」的意思。DeepWiki 是公開免認證的 server（提供讀 GitHub repo 文件的工具），拿來驗證剛好；接需要認證的 server 時，用帶 `Authorization` header 的 `reqwest::Client` 配 `StreamableHttpClientTransport::with_client(...)`。
+重點在於：兩種 transport 的 `().serve(transport)` 回傳同一個 `RunningService` 型別，所以 `tool_declarations`、`routes`、`run_tool` **全都不用改**——transport 被抽象掉了，這正是 MCP「USB 標準」的意思。DeepWiki 是公開免認證的 server（提供讀 GitHub repo 文件的工具），拿來驗證剛好。
+
+**遠端 server 的認證**
+
+實務上多數線上 server 要帶 token。rmcp 的 config 有現成的 `auth_header()`，所以不用自己組 `reqwest::Client`——設定檔多一個 `authToken` 欄位就好：
+
+```json
+    "someServer": {
+      "type": "http",
+      "url": "https://example.com/mcp",
+      "authToken": "${MY_SERVER_TOKEN}"
+    }
+```
+
+值寫成 `${VAR}` 形式、真正的 token 放環境變數，`.mcp.json` 才能安心 commit 進 repo。展開的函式很短：
+
+```rust
+/// 把 "${VAR}" 換成環境變數的值——讓 .mcp.json 裡的 token 不用寫死，可以 commit
+fn expand_env(s: &str) -> String {
+    match s.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+        Some(var) => std::env::var(var).unwrap_or_default(),
+        None => s.to_string(),
+    }
+}
+```
+
+`connect_mcp` 的 HTTP 分支從 `from_uri` 改成先建 config，有 token 就掛上去：
+
+```rust
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+
+    if let Some(url) = cfg["url"].as_str() {
+        let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_string());
+        if let Some(token) = cfg["authToken"].as_str() {
+            config = config.auth_header(expand_env(token));
+        }
+        let transport = StreamableHttpClientTransport::from_config(config);
+        return Ok(().serve(transport).await?);
+    }
+```
+
+`auth_header()` 收的是**不含 `Bearer ` 前綴**的 raw token，rmcp 自己組成 `Authorization: Bearer <token>` 送出。
+
+順帶注意兩種 transport 傳認證資料的慣例不同：stdio 分支的 `cfg["env"]` 設的是**子行程**的環境變數（server 自己去讀），而 `expand_env` 讀的是 **rs-agent 這個行程**的環境變數，展開後塞進 HTTP header。前者把秘密交給 server 進程，後者由 client 自己帶著。
 
 **這一步的核心觀念**：
 

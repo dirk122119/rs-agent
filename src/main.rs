@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use futures::StreamExt;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{Value, json};
@@ -41,11 +42,23 @@ impl SseParser {
 
 // ---------- MCP：設定、連線、工具宣告、工具執行 ----------
 
+/// 把 "${VAR}" 換成環境變數的值——讓 .mcp.json 裡的 token 不用寫死，可以 commit
+fn expand_env(s: &str) -> String {
+    match s.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+        Some(var) => std::env::var(var).unwrap_or_default(),
+        None => s.to_string(),
+    }
+}
+
 /// 依 .mcp.json 裡一個 server 的設定連線並完成握手：
 /// 有 url 走 Streamable HTTP（遠端），有 command 則 spawn 子行程（本機 stdio）
 async fn connect_mcp(cfg: &Value) -> Result<RunningService<RoleClient, ()>> {
     if let Some(url) = cfg["url"].as_str() {
-        let transport = StreamableHttpClientTransport::from_uri(url.to_string());
+        let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_string());
+        if let Some(token) = cfg["authToken"].as_str() {
+            config = config.auth_header(expand_env(token));
+        }
+        let transport = StreamableHttpClientTransport::from_config(config);
         return Ok(().serve(transport).await?);
     }
     let Some(cmd) = cfg["command"].as_str() else {
