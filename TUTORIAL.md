@@ -980,11 +980,11 @@ banner 的 `tools={}` 維持用 `routes.len()`，不要改成 `routes.len() + 1`
 
 ---
 
-## Step 7 — Provider 抽象：Gemini / OpenAI / Grok / Claude（~1050 行、拆成模組）
+## Step 7 — Provider 抽象：Gemini / OpenAI / Grok / Ollama / Claude（~1050 行、拆成模組）
 
 **學什麼**：把「哪家模型」變成一個可替換的零件。做完之後 `RS_AGENT_PROVIDER=claude` 就換一家，agent loop 一行都不用改。
 
-這是目前為止最大的一步，而且**難的地方不在 HTTP**。四家的 endpoint 和認證 header 不同是小事（各三行），真正的工程量在**訊息格式全都不一樣**——你現在的 `history: Vec<Value>` 直接就是 Gemini 的格式，這條路走不下去。
+這是目前為止最大的一步，而且**難的地方不在 HTTP**。各家的 endpoint 和認證 header 不同是小事（各三行），真正的工程量在**訊息格式全都不一樣**——你現在的 `history: Vec<Value>` 直接就是 Gemini 的格式，這條路走不下去。
 
 先看清差異在哪：
 
@@ -1002,7 +1002,7 @@ banner 的 `tools={}` 維持用 `routes.len()`，不要改成 `routes.len() + 1`
 | `max_tokens` | 選填 | 選填 | **必填** |
 | schema 子集 | 受限，要 sanitize | 較完整 | 較完整 |
 
-**Grok 幾乎免費**：xAI 是 OpenAI-compatible，同一份請求格式，只換 base URL（`api.x.ai/v1`）和模型名。所以四家只需要**三個實作**（Ollama 也走同一條路）。
+**Grok 和 Ollama 幾乎免費**：xAI 與 Ollama 都是 OpenAI-compatible，同一份請求格式，只換 base URL（`api.x.ai/v1`、`localhost:11434/v1`）和模型名。所以**五家只需要三個實作**。
 
 **(1) 拆檔案**——單一 `main.rs` 到這裡會爆掉，拆成：
 
@@ -1019,7 +1019,7 @@ src/
 
 `main.rs` 開頭加 `mod provider;` 就好，Rust 會自己去找 `src/provider/mod.rs`。
 
-**(2) 中性訊息型別**（`provider/types.rs`）——這是整步的核心。四家格式的最小公倍數：
+**(2) 中性訊息型別**（`provider/types.rs`）——這是整步的核心。各家格式的最小公倍數：
 
 ```rust
 #[derive(Clone, Copy, PartialEq)]
@@ -1052,7 +1052,7 @@ pub struct ToolDecl { pub name: String, pub description: String, pub schema: Val
 
 **(3) 兩個 trait**（`provider/mod.rs`）——這裡有個關鍵觀察：
 
-> **HTTP 與 SSE 的串流迴圈四家完全一樣，只有「怎麼組請求」與「怎麼解事件」不同。**
+> **HTTP 與 SSE 的串流迴圈各家完全一樣，只有「怎麼組請求」與「怎麼解事件」不同。**
 
 所以 trait 全是**同步**方法，非同步的部分由共用函式寫一次：
 
@@ -1139,6 +1139,7 @@ RS_AGENT_PROVIDER=gemini  GEMINI_API_KEY=...     cargo run   # 預設
 RS_AGENT_PROVIDER=openai  OPENAI_API_KEY=...     cargo run
 RS_AGENT_PROVIDER=grok    XAI_API_KEY=...        cargo run
 RS_AGENT_PROVIDER=claude  ANTHROPIC_API_KEY=...  cargo run
+RS_AGENT_PROVIDER=ollama                         cargo run   # 本機，不需要金鑰
 ```
 
 模型名用 `RS_AGENT_MODEL` 覆寫（各家有預設值）。banner 會顯示挑到哪一家：
@@ -1147,7 +1148,26 @@ RS_AGENT_PROVIDER=claude  ANTHROPIC_API_KEY=...  cargo run
 rs-agent  claude/claude-opus-5  tools=17(MCP: deepwiki, filesystem)  skills=1  (/quit 離開)
 ```
 
-真正要驗的是**同一段對話在四家之間行為一致**：問一個需要用工具的問題（「讀 Cargo.toml 告訴我有哪些依賴」），確認四家都能走完 `工具呼叫 → confirm → 結果回填 → 模型接著答` 這一圈。工具結果配對錯了的話症狀很明顯——模型會說它沒收到結果，或直接重複呼叫同一個工具。
+**抽象有沒有付清成本？** 第五家（Ollama）是最好的檢驗：它只花了 **13 行**——`openai.rs` 加一個建構子（因為 Ollama 也是 OpenAI-compatible），`from_env` 加一個分支。
+
+```rust
+/// 本機 Ollama。不需要金鑰，但 OpenAI 的 wire format 仍要有 Authorization，
+/// 所以塞一個佔位字串——這裡不能用 `var()?`，否則沒設環境變數就啟動失敗
+pub fn ollama() -> Result<Self> {
+    Ok(Self {
+        name: "ollama",
+        base: "http://localhost:11434/v1",
+        api_key: std::env::var("OLLAMA_API_KEY").unwrap_or_else(|_| "ollama".to_string()),
+        model: model_or("qwen3"),
+    })
+}
+```
+
+如果你加第五家要動到 `main.rs`、動到 agent loop、或動到中性型別，那就是接縫切錯了——回頭看 (2) 和 (3)。
+
+真正要驗的是**同一段對話在各家之間行為一致**：問一個需要用工具的問題（「讀 Cargo.toml 告訴我有哪些依賴」），確認每一家都能走完 `工具呼叫 → confirm → 結果回填 → 模型接著答` 這一圈。工具結果配對錯了的話症狀很明顯——模型會說它沒收到結果，或直接重複呼叫同一個工具。
+
+**Ollama 是唯一不需要金鑰的驗證路徑**，所以拿它把 OpenAI-compat 那條路（partial JSON 累積、`role="tool"` 拆訊息）實測到底最划算——同一份程式碼驗過了，OpenAI 與 Grok 就只剩 base URL 和模型名的差別。一個提醒：本機小模型的 tool calling 通常很弱，而你會一次餵給它十幾個 MCP 工具。測試時先把 `.mcp.json` 縮到只留 filesystem，否則分不清是接線錯了還是模型接不住。
 
 **這一步的核心觀念**：
 
@@ -1160,7 +1180,7 @@ rs-agent  claude/claude-opus-5  tools=17(MCP: deepwiki, filesystem)  skills=1  (
 
 ## 結語 — 從 rs-agent 到 rs-cli
 
-到這裡你已經有一個約 1050 行、接得上 MCP 生態、帶 Skills、四家模型可換的完整 agent（`main.rs` 264 行 + `provider/` 五個檔案）。rs-cli 做的事就是在這個骨架上繼續疊工程化的東西，對照著讀：
+到這裡你已經有一個約 1050 行、接得上 MCP 生態、帶 Skills、五家模型可換的完整 agent（`main.rs` 264 行 + `provider/` 五個檔案）。rs-cli 做的事就是在這個骨架上繼續疊工程化的東西，對照著讀：
 
 | rs-agent 的做法 | rs-cli 的做法 | 檔案 |
 |---|---|---|
@@ -1174,7 +1194,7 @@ rs-agent  claude/claude-opus-5  tools=17(MCP: deepwiki, filesystem)  skills=1  (
 
 1. **在 `.mcp.json` 多接一個 server**（例如 `@modelcontextprotocol/server-memory`），然後把「同名工具先到先贏」改成不會衝突的做法（提示：rs-cli 用 `server__tool` 前綴——宣告時加上去、呼叫時拆回來）
 2. **加第二個技能**，感受「加技能不用改程式碼」
-3. **加一家 Ollama**（本地模型）——它也是 OpenAI-compatible，所以只要在 `openai.rs` 加一個建構子（base URL 指向 `http://localhost:11434/v1`）和 `from_env` 一個分支。這題的重點是感受抽象有沒有付清成本：如果超過十行，就是 Step 7 的接縫切錯了
+3. **讓 `confirm()` 記住「這個工具本次 session 一律允許」**——多一個 `[y/N/a]` 選項，`a` 就把工具名記進一個 `HashSet`，之後同名工具不再問。這是 Claude Code 的 "Always Allow" 的最小版本，也會讓你發現 `confirm()` 需要一個能跨輪保存的狀態
 4. **裁 history**：超過字元預算時砍掉最舊的 turn，但**不能拆散 tool call/result 配對**（OpenAI 和 Claude 都會因為 `tool_use` 少了對應的結果而 400）——這題會讓你發現中性型別讓這件事變好寫
 5. **看 Claude 的思考過程**：body 加上 `"thinking": {"type": "adaptive", "display": "summarized"}`，然後在解碼器裡把 `thinking_delta` 也印出來（現在只累積不印）
 

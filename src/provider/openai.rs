@@ -41,6 +41,17 @@ impl OpenAiCompat {
             model: model_or("grok-4"),
         })
     }
+
+    /// 本機 Ollama。不需要金鑰，但 OpenAI 的 wire format 仍要有 Authorization，
+    /// 所以塞一個佔位字串——這裡不能用 `var()?`，否則沒設環境變數就啟動失敗
+    pub fn ollama() -> Result<Self> {
+        Ok(Self {
+            name: "ollama",
+            base: "http://localhost:11434/v1",
+            api_key: std::env::var("OLLAMA_API_KEY").unwrap_or_else(|_| "ollama".to_string()),
+            model: model_or("qwen3"),
+        })
+    }
 }
 
 /// 中性訊息 → OpenAI 的 messages。system prompt 是第一則訊息（不是獨立欄位）

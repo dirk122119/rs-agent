@@ -1,6 +1,6 @@
 //! Provider 抽象：把「哪家模型」收斂成兩件事——怎麼組請求、怎麼解事件。
 //!
-//! 關鍵觀察是：HTTP 與 SSE 的串流迴圈四家完全一樣，只有請求組裝與事件解析不同。
+//! 關鍵觀察是：HTTP 與 SSE 的串流迴圈各家完全一樣，只有請求組裝與事件解析不同。
 //! 所以 trait 全部是同步方法（因此天然 dyn-compatible，不需要 async_trait），
 //! 非同步的部分由共用的 stream_once 一次寫好。
 
@@ -77,7 +77,7 @@ pub(crate) fn emit(text: &str) {
     let _ = io::stdout().flush();
 }
 
-// ---------- 共用的串流迴圈：四家一模一樣 ----------
+// ---------- 共用的串流迴圈：各家一模一樣 ----------
 
 pub async fn stream_once(
     provider: &dyn Provider,
@@ -113,11 +113,12 @@ pub fn from_env() -> Result<Box<dyn Provider>> {
     match which.as_str() {
         "gemini" => Ok(Box::new(gemini::Gemini::from_env()?)),
         "openai" => Ok(Box::new(openai::OpenAiCompat::openai()?)),
-        // Grok 是 OpenAI-compatible，同一份實作只換 base URL 與模型
+        // Grok 與 Ollama 都是 OpenAI-compatible，同一份實作只換 base URL 與模型
         "grok" => Ok(Box::new(openai::OpenAiCompat::grok()?)),
+        "ollama" => Ok(Box::new(openai::OpenAiCompat::ollama()?)),
         "claude" => Ok(Box::new(claude::Claude::from_env()?)),
         other => bail!(
-            "不認識的 RS_AGENT_PROVIDER：{other}（可用：gemini / openai / grok / claude）"
+            "不認識的 RS_AGENT_PROVIDER：{other}（可用：gemini / openai / grok / ollama / claude）"
         ),
     }
 }
