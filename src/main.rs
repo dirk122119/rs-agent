@@ -78,9 +78,11 @@ async fn connect_mcp(cfg: &Value) -> Result<RunningService<RoleClient, ()>> {
 }
 
 /// 跟每個 MCP server 要工具清單，合併轉成 Gemini 的 functionDeclarations 格式。
-/// 同時回傳 routes：工具名 → server 索引，呼叫時才知道要轉發給誰
+/// 同時回傳 routes：工具名 → server 索引，呼叫時才知道要轉發給誰。
+/// 本地的 read_skill 工具也在這裡追加，但不進 routes（它不屬於任何 server）
 async fn tool_declarations(
     services: &[RunningService<RoleClient, ()>],
+    skills: &[Skill],
 ) -> Result<(Value, HashMap<String, usize>)> {
     let mut decls: Vec<Value> = Vec::new();
     let mut routes = HashMap::new();
@@ -96,6 +98,20 @@ async fn tool_declarations(
                 "parameters": sanitize_schema(&Value::Object((*t.input_schema).clone())),
             }));
         }
+    }
+    // 有技能才給 read_skill——沒技能還宣告這個工具，只會換來一次空轉
+    if !skills.is_empty() {
+        decls.push(json!({
+            "name": "read_skill",
+            "description": "讀取一個技能的完整說明。執行技能相關任務前先呼叫這個。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "技能名稱"}
+                },
+                "required": ["name"]
+            }
+        }));
     }
     Ok((json!([{"functionDeclarations": decls}]), routes))
 }
@@ -142,6 +158,59 @@ fn confirm() -> Result<bool> {
     Ok(matches!(line.trim(), "y" | "yes"))
 }
 
+// ---------- Skills：漸進式揭露 ----------
+
+struct Skill {
+    name: String,
+    description: String,
+    path: std::path::PathBuf,
+}
+
+/// 掃 skills/<name>/SKILL.md，只解析 frontmatter 的 name/description，不讀內文
+fn load_skills(dir: &str) -> Vec<Skill> {
+    let mut skills = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return skills; // 沒有 skills 目錄就是零技能，不是錯誤
+    };
+    for entry in entries.flatten() {
+        let path = entry.path().join("SKILL.md");
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // frontmatter = 開頭兩個 --- 之間的區塊
+        let Some(rest) = raw.strip_prefix("---") else { continue };
+        let Some((fm, _body)) = rest.split_once("---") else { continue };
+        let field = |key: &str| {
+            fm.lines()
+                .find_map(|l| l.strip_prefix(&format!("{key}:")))
+                .map(|v| v.trim().to_string())
+        };
+        let (Some(name), Some(description)) = (field("name"), field("description")) else {
+            continue;
+        };
+        skills.push(Skill { name, description, path });
+    }
+    // read_dir 的順序未定義，排序讓 system prompt 可重現（也才吃得到 prefix cache）
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills
+}
+
+/// system prompt 只放目錄：一行一個技能，全文等模型自己用 read_skill 拉
+fn system_prompt(skills: &[Skill]) -> String {
+    let mut s = String::from("你是 rs-agent，一個在終端機執行的助理。");
+    if !skills.is_empty() {
+        s.push_str(
+            "\n\n# Skills\n\
+             以下是可用的技能。當任務符合某個技能的描述時，\
+             先用 read_skill 工具讀取全文，再照指示執行：\n",
+        );
+        for sk in skills {
+            s.push_str(&format!("- {}: {}\n", sk.name, sk.description));
+        }
+    }
+    s
+}
+
 // ---------- 呼叫模型一次（串流），回傳 (文字, 工具呼叫們) ----------
 
 async fn stream_once(
@@ -149,8 +218,10 @@ async fn stream_once(
     api_key: &str,
     history: &[Value],
     tools: &Value,
+    system: &str,
 ) -> Result<(String, Vec<Value>)> {
     let body = json!({
+        "systemInstruction": {"parts": [{"text": system}]},
         "contents": history,
         "tools": tools,
     });
@@ -213,12 +284,17 @@ async fn main() -> Result<()> {
         services.push(connect_mcp(cfg).await?);
         names.push(name.as_str());
     }
-    let (tools, routes) = tool_declarations(&services).await?;
+
+    // 技能目錄進 system prompt，全文等模型自己用 read_skill 拉
+    let skills = load_skills("skills");
+    let system = system_prompt(&skills);
+    let (tools, routes) = tool_declarations(&services, &skills).await?;
 
     println!(
-        "rs-agent  model={MODEL}  tools={}(MCP: {})  (/quit 離開)",
+        "rs-agent  model={MODEL}  tools={}(MCP: {})  skills={}  (/quit 離開)",
         routes.len(),
-        names.join(", ")
+        names.join(", "),
+        skills.len()
     );
     loop {
         print!("❯ ");
@@ -239,7 +315,7 @@ async fn main() -> Result<()> {
 
         // agent loop：模型可能連續呼叫工具，直到不再呼叫為止
         loop {
-            let (text, calls) = stream_once(&client, &api_key, &history, &tools).await?;
+            let (text, calls) = stream_once(&client, &api_key, &history, &tools, &system).await?;
 
             // 把模型這輪的輸出（文字 + 工具呼叫）記回 history
             let mut parts = Vec::new();
@@ -262,7 +338,14 @@ async fn main() -> Result<()> {
             for c in &calls {
                 let name = c["name"].as_str().unwrap_or_default();
                 println!("⏺ {name} {}", c["args"]);
-                let output = if let Some(&i) = routes.get(name) {
+                // read_skill 是本地工具，唯讀且模型碰不到路徑，不需要 confirm()
+                let output = if name == "read_skill" {
+                    let skill_name = c["args"]["name"].as_str().unwrap_or_default();
+                    skills.iter().find(|s| s.name == skill_name).map_or_else(
+                        || format!("unknown skill: {skill_name}"),
+                        |s| std::fs::read_to_string(&s.path).unwrap_or_else(|e| format!("error: {e}")),
+                    )
+                } else if let Some(&i) = routes.get(name) {
                     if confirm()? {
                         run_tool(&services[i], name, &c["args"]).await
                     } else {

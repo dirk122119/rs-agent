@@ -811,7 +811,7 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 
 ---
 
-## Step 6 — Skills：漸進式揭露（~300 行）
+## Step 6 — Skills：漸進式揭露（~370 行）
 
 **學什麼**：Skills 是給 agent 的「使用手冊」——把領域知識寫成 Markdown 檔，agent 需要時自己翻。重點是**漸進式揭露（progressive disclosure）**：system prompt 只放目錄（每個技能一行 name + description），全文等模型自己判斷需要時才用 `read_skill` 工具讀進 context。技能再多，平時只占目錄那幾行的 token；而且加技能＝加一個檔案，不用改程式、不用重編譯。
 
@@ -866,9 +866,13 @@ fn load_skills(dir: &str) -> Vec<Skill> {
         };
         skills.push(Skill { name, description, path });
     }
+    // read_dir 的順序未定義，排序讓 system prompt 可重現（也才吃得到 prefix cache）
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
     skills
 }
 ```
+
+那行排序不是潔癖：`std::fs::read_dir` 不保證順序，不排的話 system prompt 的技能目錄會因機器、因檔案增刪而變動——同樣的問題問兩次可能得到不同的 prompt 前綴，既不好 debug，也讓 Gemini 的隱式 prefix cache 失效。
 
 **(2) system prompt**（新函式）——目錄只放一行一個技能，並告訴模型「先讀再做」：
 
@@ -899,25 +903,38 @@ fn system_prompt(skills: &[Skill]) -> String {
     });
 ```
 
-（`stream_once` 簽名多帶一個 `system: &str`。順便你就學會了 system prompt 怎麼加——想給 agent 個性也是改這裡。）
+（`stream_once` 簽名多帶一個 `system: &str`，**加在參數列最後**。別放在 `api_key` 旁邊——兩個都是 `&str` 又相鄰，呼叫端萬一寫反了型別檢查不會攔，結果是把 API key 當成 system prompt 送出去。放最後則相鄰參數型別各不相同，寫反直接編譯失敗。順便你就學會了 system prompt 怎麼加——想給 agent 個性也是改這裡。）
 
-**(3) `read_skill` 工具**——手動附加到 MCP 來的宣告清單後面（在 `tool_declarations` 裡 `decls.push(...)`）：
+**(3) `read_skill` 工具**——手動附加到 MCP 來的宣告清單後面。`tool_declarations` 簽名多收一個 `skills: &[Skill]`，在 `return` 前 push；注意它**不進 `routes`**，因為它背後沒有任何 server：
 
 ```rust
-    decls.push(json!({
-        "name": "read_skill",
-        "description": "讀取一個技能的完整說明。執行技能相關任務前先呼叫這個。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "技能名稱"}
-            },
-            "required": ["name"]
-        }
-    }));
+async fn tool_declarations(
+    services: &[RunningService<RoleClient, ()>],
+    skills: &[Skill],
+) -> Result<(Value, HashMap<String, usize>)> {
+    // ...原本走訪每個 server 的迴圈照舊...
+
+    // 有技能才給 read_skill——沒技能還宣告這個工具，只會換來一次空轉
+    if !skills.is_empty() {
+        decls.push(json!({
+            "name": "read_skill",
+            "description": "讀取一個技能的完整說明。執行技能相關任務前先呼叫這個。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "技能名稱"}
+                },
+                "required": ["name"]
+            }
+        }));
+    }
+    Ok((json!([{"functionDeclarations": decls}]), routes))
+}
 ```
 
-然後在 main 的工具分派處攔截：名字是 `read_skill` 就本地讀檔，其他照舊走 MCP。`read_skill` 不需要 `confirm()`——它唯讀、路徑受控（只能讀 `load_skills` 掃到的那幾個檔案），跟「跑任意 shell 指令」的風險等級完全不同：
+`!skills.is_empty()` 這個條件值得一提：沒有 `skills/` 目錄時還把 `read_skill` 宣告出去，等於給模型一個背後空無一物的工具——它最好的下場是浪費一次來回、拿到 `unknown skill` 再自己修正。工具宣告要跟實際能力對齊。
+
+然後在 main 的工具分派處攔截：名字是 `read_skill` 就本地讀檔，其他照舊走 MCP。`read_skill` 不需要 `confirm()`——它唯讀，而且模型從頭到尾碰不到路徑的任何一段：模型給的字串只拿去跟 `s.name` 做等值比對，真正打開的是 `load_skills` 啟動時掃到的 `s.path`。沒有路徑穿越的施力點，跟「跑任意 shell 指令」的風險等級完全不同：
 
 ```rust
     let output = if name == "read_skill" {
@@ -937,7 +954,9 @@ fn system_prompt(skills: &[Skill]) -> String {
     };
 ```
 
-**(4) `main`**——啟動時 `let skills = load_skills("skills");`、`let system = system_prompt(&skills);`，banner 加上 `skills={}`（用 `skills.len()`）。
+**(4) `main`**——啟動時 `let skills = load_skills("skills");`、`let system = system_prompt(&skills);`，banner 加上 `skills={}`（用 `skills.len()`）。這兩行要放在 `tool_declarations(&services, &skills)` **之前**，因為現在得把 skills 傳進去。
+
+banner 的 `tools={}` 維持用 `routes.len()`，不要改成 `routes.len() + 1`——那是把「內建工具剛好只有一個」寫死進算式，日後多一個就默默算錯；而字串本身已經用 `(MCP: ...)` 界定了那個數字的範圍，`skills={}` 則涵蓋新增的那一塊。
 
 **驗證**（重點是驗「漸進式揭露」兩面都成立）：
 
@@ -956,7 +975,7 @@ fn system_prompt(skills: &[Skill]) -> String {
 **這一步的核心觀念**：
 
 1. system prompt 只放**索引**，內容**按需載入**——這就是 context 工程最基本的一招：不是塞更多，而是讓模型自己決定何時拉取
-2. 技能就是檔案——加技能不用改程式碼、不用重編譯，丟一個 `SKILL.md` 進去就生效
+2. 技能就是檔案——加技能不用改程式碼、不用重編譯，丟一個 `SKILL.md` 進去、重啟就生效（`load_skills` 只在啟動時掃一次；想做到丟進去立刻生效，把它移到 REPL 迴圈開頭每輪重掃即可）
 3. `description` 的品質直接決定模型會不會在對的時機想起這個技能——寫「本專案 git commit 訊息的撰寫規範，寫 commit 訊息前必讀」而不是「commit 相關」
 
 ---
