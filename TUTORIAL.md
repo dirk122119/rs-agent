@@ -980,14 +980,191 @@ banner 的 `tools={}` 維持用 `routes.len()`，不要改成 `routes.len() + 1`
 
 ---
 
+## Step 7 — Provider 抽象：Gemini / OpenAI / Grok / Claude（~1050 行、拆成模組）
+
+**學什麼**：把「哪家模型」變成一個可替換的零件。做完之後 `RS_AGENT_PROVIDER=claude` 就換一家，agent loop 一行都不用改。
+
+這是目前為止最大的一步，而且**難的地方不在 HTTP**。四家的 endpoint 和認證 header 不同是小事（各三行），真正的工程量在**訊息格式全都不一樣**——你現在的 `history: Vec<Value>` 直接就是 Gemini 的格式，這條路走不下去。
+
+先看清差異在哪：
+
+| | Gemini | OpenAI / Grok | Claude |
+|---|---|---|---|
+| endpoint | `models/{m}:streamGenerateContent?alt=sse` | `/v1/chat/completions` | `/v1/messages` |
+| 認證 | `x-goog-api-key` | `Authorization: Bearer` | `x-api-key` + `anthropic-version` |
+| 訊息欄位 | `contents` | `messages` | `messages` |
+| 助理角色名 | `model` | `assistant` | `assistant` |
+| system prompt | `systemInstruction` 欄位 | `messages[0]` role=system | **頂層 `system` 欄位** |
+| 工具宣告 | `tools[0].functionDeclarations[]`、`parameters` | `tools[].function{}`、`parameters` | `tools[]`、**`input_schema`** |
+| 工具結果怎麼配對 | 用**工具名** | 用 **id**（`tool_call_id`） | 用 **id**（`tool_use_id`） |
+| 工具結果放哪 | `user` 訊息的 part | **獨立的 role="tool" 訊息，一個結果一則** | `user` 訊息的 content 塊 |
+| 串流裡的工具參數 | 完整 JSON 物件 | **字串碎片**，要累積 | **字串碎片**，要累積 |
+| `max_tokens` | 選填 | 選填 | **必填** |
+| schema 子集 | 受限，要 sanitize | 較完整 | 較完整 |
+
+**Grok 幾乎免費**：xAI 是 OpenAI-compatible，同一份請求格式，只換 base URL（`api.x.ai/v1`）和模型名。所以四家只需要**三個實作**（Ollama 也走同一條路）。
+
+**(1) 拆檔案**——單一 `main.rs` 到這裡會爆掉，拆成：
+
+```
+src/
+  main.rs              REPL + agent loop + MCP + Skills
+  provider/
+    mod.rs             兩個 trait、共用串流迴圈、SseParser、依環境變數挑一家
+    types.rs           中性訊息型別
+    gemini.rs
+    openai.rs          OpenAI 與 Grok 共用
+    claude.rs
+```
+
+`main.rs` 開頭加 `mod provider;` 就好，Rust 會自己去找 `src/provider/mod.rs`。
+
+**(2) 中性訊息型別**（`provider/types.rs`）——這是整步的核心。四家格式的最小公倍數：
+
+```rust
+#[derive(Clone, Copy, PartialEq)]
+pub enum Role { User, Assistant }
+
+#[derive(Clone)]
+pub enum Block {
+    Text(String),
+    /// 模型要求呼叫工具。id 是給 OpenAI/Claude 配對用的，Gemini 改用 name 配對
+    ToolCall { id: String, name: String, args: Value },
+    /// 工具結果。id 與 name 都帶著，因為各家配對方式不同
+    ToolResult { id: String, name: String, content: String },
+    /// 某家 provider 專屬、且必須原封不動送回的塊（例如 Claude 的 thinking）。
+    /// 產生它的 provider 認得它，其他 provider 直接跳過
+    Opaque(Value),
+}
+
+pub struct Message { pub role: Role, pub blocks: Vec<Block> }
+```
+
+兩個設計決定值得說明。**`ToolResult` 同時帶 `id` 和 `name`**：不是冗餘，是因為 Gemini 拿名字配對、另兩家拿 id 配對，中性型別必須同時滿足。**`Block::Opaque`** 是給「看不懂但必須原樣送回」的塊用的——Claude 的 thinking block 就是這種，少了它多輪對話會 400。
+
+工具宣告也要中性化，直接帶 MCP 給的原始 schema，清不清理交給各 provider：
+
+```rust
+pub struct ToolDecl { pub name: String, pub description: String, pub schema: Value }
+```
+
+`sanitize_schema` 因此從 `tool_declarations` 搬進 `provider/gemini.rs`——它是 Gemini 專屬的限制，不該汙染其他家。
+
+**(3) 兩個 trait**（`provider/mod.rs`）——這裡有個關鍵觀察：
+
+> **HTTP 與 SSE 的串流迴圈四家完全一樣，只有「怎麼組請求」與「怎麼解事件」不同。**
+
+所以 trait 全是**同步**方法，非同步的部分由共用函式寫一次：
+
+```rust
+pub trait Provider {
+    fn name(&self) -> &str;
+    fn model(&self) -> &str;
+    /// 組出一個「還沒送出」的請求：URL、認證 header、body 都在這裡決定
+    fn request(&self, client: &reqwest::Client, history: &[Message],
+               tools: &[ToolDecl], system: &str) -> Result<reqwest::RequestBuilder>;
+    /// 每次請求開一個新的解碼器（它要保存跨事件的累積狀態）
+    fn decoder(&self) -> Box<dyn Decoder>;
+}
+
+pub trait Decoder {
+    /// 餵進一個 data payload。文字要即時印出來
+    fn push(&mut self, data: &str) -> Result<()>;
+    /// 收尾，回傳這一輪助理訊息的內容塊
+    fn finish(self: Box<Self>) -> Vec<Block>;
+}
+```
+
+同步的好處不只是簡單：**Rust 的 async fn in trait 不能做成 trait object**，而我們需要 `Box<dyn Provider>`（執行期才知道要哪家）。切成同步就天然 dyn-compatible，不必引入 `async_trait` 依賴。
+
+共用的串流迴圈就是原本的 `stream_once` 拿掉 Gemini 專屬部分：
+
+```rust
+pub async fn stream_once(
+    provider: &dyn Provider, client: &reqwest::Client,
+    history: &[Message], tools: &[ToolDecl], system: &str,
+) -> Result<Vec<Block>> {
+    let resp = provider.request(client, history, tools, system)?.send().await?;
+    if !resp.status().is_success() {
+        bail!("API error {}: {}", resp.status(), resp.text().await?);
+    }
+    let mut parser = SseParser::new();
+    let mut decoder = provider.decoder();
+    let mut bytes = resp.bytes_stream();
+    while let Some(chunk) = bytes.next().await {
+        for data in parser.push(&chunk?) {
+            decoder.push(&data)?;
+        }
+    }
+    println!();
+    Ok(decoder.finish())
+}
+```
+
+`SseParser`（Step 3 寫的）也搬進來共用——三家都是 `data:` 行，Claude 雖然多送 `event:` 行但 payload 自帶 `"type"` 欄位，不看 `event:` 也能解。
+
+**(4) 三個實作的怪癖**
+
+*Gemini*：每個 chunk 都是完整 JSON，工具呼叫是完整物件，不需要累積。它不給工具呼叫 id，所以解碼器補一個序號讓中性型別完整（反正 Gemini 用名字配對，id 用不到）。
+
+*OpenAI / Grok*：工具參數在串流裡是碎片，按 `delta.tool_calls[].index` 分組累積，`id` 與 `name` 只在該 index 的第一個碎片出現：
+
+```rust
+if let Some(a) = tc["function"]["arguments"].as_str() {
+    slot.json.push_str(a);       // 累積碎片
+}
+// ...全部收完才 parse
+args: serde_json::from_str(&c.json).unwrap_or_else(|_| json!({})),
+```
+
+還有一個結構性差異：工具結果是**獨立的 `role="tool"` 訊息**，所以「一則中性訊息」會展開成**多則** wire 訊息。這是為什麼中性型別要能一對多轉換。另外 `arguments` 是 JSON **字串**不是物件，送回去時要 `args.to_string()`。串流結尾會多送一個 `data: [DONE]`，解碼器直接忽略。
+
+*Claude*：SSE 是具型別的事件流，用 `index` 開／關內容塊：
+
+```
+content_block_start  {index, content_block: {type: "text"|"tool_use"|"thinking", ...}}
+content_block_delta  {index, delta: {type: "text_delta"|"input_json_delta"|"thinking_delta", ...}}
+content_block_stop   {index}
+message_delta        {delta: {stop_reason}}
+```
+
+解碼器用 `BTreeMap<u64, Slot>` 存槽位，收尾時 index 順序即原始順序。最容易踩的坑是 **thinking**：`claude-opus-5` 預設開啟思考，而多輪對話**必須把 thinking block 原封不動送回**（含 `signature`），改動或刪掉都會 400。處理方式不是特別為它寫程式，而是讓解碼器**忠實重建整個 content 陣列**——認得的塊轉成 `Text`/`ToolCall`，不認得的原樣存進 `Block::Opaque`，送回時直接吐出來。text / thinking / tool_use 一體適用，比過濾簡單。
+
+（順帶一提：關掉思考不是好選擇。官方文件明確警告，`thinking: {"type": "disabled"}` 在工具密集的 agent 上會出現「模型把工具呼叫寫成純文字、呼叫靜默不執行」的失敗模式——不報錯、不 panic，只是那一輪什麼都沒做。你有十幾個 MCP 工具，正是最容易中的情境。）
+
+**(5) 切換與驗證**
+
+```bash
+RS_AGENT_PROVIDER=gemini  GEMINI_API_KEY=...     cargo run   # 預設
+RS_AGENT_PROVIDER=openai  OPENAI_API_KEY=...     cargo run
+RS_AGENT_PROVIDER=grok    XAI_API_KEY=...        cargo run
+RS_AGENT_PROVIDER=claude  ANTHROPIC_API_KEY=...  cargo run
+```
+
+模型名用 `RS_AGENT_MODEL` 覆寫（各家有預設值）。banner 會顯示挑到哪一家：
+
+```
+rs-agent  claude/claude-opus-5  tools=17(MCP: deepwiki, filesystem)  skills=1  (/quit 離開)
+```
+
+真正要驗的是**同一段對話在四家之間行為一致**：問一個需要用工具的問題（「讀 Cargo.toml 告訴我有哪些依賴」），確認四家都能走完 `工具呼叫 → confirm → 結果回填 → 模型接著答` 這一圈。工具結果配對錯了的話症狀很明顯——模型會說它沒收到結果，或直接重複呼叫同一個工具。
+
+**這一步的核心觀念**：
+
+1. **抽象要抽在對的接縫上**。直覺會想「每家寫一個 `async fn chat()`」，但那會把四份幾乎一樣的 HTTP/SSE 迴圈複製四遍。找到真正的變異點（組請求、解事件）之後，共用的部分反而更多。
+2. **中性型別的欄位是被最嚴格的那家決定的**。`ToolResult` 帶 id 又帶 name 看起來冗餘，但少任一個就有一家接不起來。這就是 rs-cli 要有 `types.rs` 的原因。
+3. **「必須原樣送回」是真實存在的約束**。`Block::Opaque` 不是設計潔癖——provider 會有你不該解讀、但必須保留的狀態（Claude 的 thinking signature、將來的加密推理塊）。中性型別要留這個逃生口。
+4. 同步 trait + 共用非同步驅動，是 Rust 裡繞開「async trait 不能 dyn」的標準手法，而且順便讓抽象更小。
+
+---
+
 ## 結語 — 從 rs-agent 到 rs-cli
 
-到這裡你已經有一個約 300 行、接得上 MCP 生態、帶 Skills 的完整 agent。rs-cli 做的事就是在這個骨架上繼續疊工程化的東西，對照著讀：
+到這裡你已經有一個約 1050 行、接得上 MCP 生態、帶 Skills、四家模型可換的完整 agent（`main.rs` 264 行 + `provider/` 五個檔案）。rs-cli 做的事就是在這個骨架上繼續疊工程化的東西，對照著讀：
 
 | rs-agent 的做法 | rs-cli 的做法 | 檔案 |
 |---|---|---|
-| 寫死 Gemini | `Provider` trait + 三個實作，config 切換 | `src/provider/mod.rs` |
-| 訊息用 `serde_json::Value` 硬組 | 內部統一 `Message`/`ContentBlock` 型別，各 provider 自己轉換 | `src/provider/types.rs` |
+| 用 `RS_AGENT_PROVIDER` 環境變數挑 provider | config 檔管理 provider／模型／金鑰，可 per-project 覆寫 | `src/config.rs` |
 | 多 server 但同名工具先到先贏 | 工具名加 `server__` 前綴避免衝突，單一 server 掛掉不影響其他 | `src/mcp/manager.rs` |
 | main 裡一坨 loop | agent loop 抽成 `Agent::run_turn`，UI 用 callback 解耦 | `src/agent.rs` |
 | history 無限長 | 超過字元預算時裁掉舊 turn（注意不能拆散 tool call/result 配對） | `agent.rs` 的 `trim_history` |
@@ -997,7 +1174,9 @@ banner 的 `tools={}` 維持用 `routes.len()`，不要改成 `routes.len() + 1`
 
 1. **在 `.mcp.json` 多接一個 server**（例如 `@modelcontextprotocol/server-memory`），然後把「同名工具先到先贏」改成不會衝突的做法（提示：rs-cli 用 `server__tool` 前綴——宣告時加上去、呼叫時拆回來）
 2. **加第二個技能**，感受「加技能不用改程式碼」
-3. **抽 Provider trait**：定義 `trait Provider { async fn chat(...) }`，先做 Gemini 實作，再加一個 Ollama（OpenAI-compat）實作——做完你就懂為什麼 rs-cli 要有 `types.rs`
+3. **加一家 Ollama**（本地模型）——它也是 OpenAI-compatible，所以只要在 `openai.rs` 加一個建構子（base URL 指向 `http://localhost:11434/v1`）和 `from_env` 一個分支。這題的重點是感受抽象有沒有付清成本：如果超過十行，就是 Step 7 的接縫切錯了
+4. **裁 history**：超過字元預算時砍掉最舊的 turn，但**不能拆散 tool call/result 配對**（OpenAI 和 Claude 都會因為 `tool_use` 少了對應的結果而 400）——這題會讓你發現中性型別讓這件事變好寫
+5. **看 Claude 的思考過程**：body 加上 `"thinking": {"type": "adaptive", "display": "summarized"}`，然後在解碼器裡把 `thinking_delta` 也印出來（現在只累積不印）
 
 ---
 

@@ -4,7 +4,9 @@
 //! 所以 trait 全部是同步方法（因此天然 dyn-compatible，不需要 async_trait），
 //! 非同步的部分由共用的 stream_once 一次寫好。
 
+mod claude;
 mod gemini;
+mod openai;
 pub mod types;
 
 pub use types::{Block, Message, ToolDecl, tool_calls};
@@ -110,6 +112,12 @@ pub fn from_env() -> Result<Box<dyn Provider>> {
     let which = std::env::var("RS_AGENT_PROVIDER").unwrap_or_else(|_| "gemini".to_string());
     match which.as_str() {
         "gemini" => Ok(Box::new(gemini::Gemini::from_env()?)),
-        other => bail!("不認識的 RS_AGENT_PROVIDER：{other}（可用：gemini）"),
+        "openai" => Ok(Box::new(openai::OpenAiCompat::openai()?)),
+        // Grok 是 OpenAI-compatible，同一份實作只換 base URL 與模型
+        "grok" => Ok(Box::new(openai::OpenAiCompat::grok()?)),
+        "claude" => Ok(Box::new(claude::Claude::from_env()?)),
+        other => bail!(
+            "不認識的 RS_AGENT_PROVIDER：{other}（可用：gemini / openai / grok / claude）"
+        ),
     }
 }
